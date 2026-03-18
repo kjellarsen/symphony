@@ -37,8 +37,11 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
      operations such as comment editing or upload flows.
 5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
-     URL.
+   - `tracker.project_slug` should be the Linear project `slugId`.
+   - If you use the Windows launcher setup flow, it accepts a project slug, project URL, or project
+     name, resolves the input to the canonical `slugId` when possible, and asks for confirmation
+     before writing it to `WORKFLOW.md`.
+   - If you edit the workflow manually, you can still get the slug from the Linear project URL.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
@@ -128,6 +131,8 @@ Notes:
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- On Windows, HTTPS requests to Linear use `castore` as a CA trust-store fallback so Symphony does
+  not depend entirely on the host Erlang certificate store behaving correctly.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the

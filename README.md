@@ -36,6 +36,24 @@ help with the setup:
 
 ---
 
+## Windows launcher
+
+This fork tracks the Windows launcher templates under `scripts/windows`.
+
+Install or refresh the launcher with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\windows\install-symphony-launcher.ps1
+```
+
+That writes generated wrappers to `%APPDATA%\npm\symphony.ps1` and `%APPDATA%\npm\symphony.cmd`,
+stamping in the current repo root. The generated files are local install artifacts; the tracked
+templates in this repo are the source of truth.
+
+The Windows setup flow accepts a Linear project slug, project URL, or project name. When
+`LINEAR_API_KEY` is available, it resolves that input to the canonical Linear `slugId` and asks
+for confirmation before writing it to `WORKFLOW.md`.
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).

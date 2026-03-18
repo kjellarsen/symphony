@@ -1,0 +1,651 @@
+param(
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]]$SymphonyArgs
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Resolve-WorkflowPath {
+  param([string]$StartDir)
+
+  $dirInfo = Get-Item -LiteralPath $StartDir
+  if (-not $dirInfo.PSIsContainer) {
+    $dirInfo = $dirInfo.Directory
+  }
+
+  while ($dirInfo) {
+    $candidate = Join-Path $dirInfo.FullName 'WORKFLOW.md'
+    if (Test-Path -LiteralPath $candidate) {
+      return $candidate
+    }
+    $dirInfo = $dirInfo.Parent
+  }
+
+  return $null
+}
+
+function Get-RepoRoot {
+  try {
+    $root = git rev-parse --show-toplevel 2>$null
+    if ($LASTEXITCODE -eq 0 -and $root) {
+      return $root.Trim()
+    }
+  } catch {
+  }
+
+  return (Get-Location).Path
+}
+
+function Get-GitRemoteUrl {
+  param([string]$RepoRoot)
+
+  try {
+    Push-Location $RepoRoot
+    $url = git remote get-url origin 2>$null
+    if ($LASTEXITCODE -eq 0 -and $url) {
+      return $url.Trim()
+    }
+  } catch {
+  } finally {
+    Pop-Location
+  }
+
+  return ''
+}
+
+function Get-RepoNameCandidates {
+  param([string]$RepoRoot)
+
+  $candidates = @()
+
+  if (-not [string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $candidates += Split-Path $RepoRoot -Leaf
+  }
+
+  $remoteUrl = Get-GitRemoteUrl -RepoRoot $RepoRoot
+  if ($remoteUrl -match '/([^/]+?)(?:\.git)?$') {
+    $candidates += $matches[1]
+  }
+
+  $candidates |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    ForEach-Object { $_.Trim() } |
+    Select-Object -Unique
+}
+
+function Normalize-LinearProjectReference {
+  param([string]$Value)
+
+  if ([string]::IsNullOrWhiteSpace($Value)) {
+    return $null
+  }
+
+  $trimmed = $Value.Trim()
+  if ($trimmed -match '^https?://') {
+    try {
+      $uri = [System.Uri]$trimmed
+      $segments = $uri.AbsolutePath.Trim('/') -split '/'
+      if ($segments.Length -gt 0) {
+        return $segments[-1].Trim().ToLowerInvariant()
+      }
+    } catch {
+    }
+  }
+
+  return $trimmed.ToLowerInvariant()
+}
+
+function Get-LinearProjectUrlSlug {
+  param([string]$Url)
+
+  if ([string]::IsNullOrWhiteSpace($Url)) {
+    return $null
+  }
+
+  try {
+    $uri = [System.Uri]$Url
+    $segments = $uri.AbsolutePath.Trim('/') -split '/'
+    if ($segments.Length -gt 0) {
+      return $segments[-1]
+    }
+  } catch {
+  }
+
+  return $null
+}
+
+function Get-LinearHumanProjectSlug {
+  param(
+    [string]$Url,
+    [string]$SlugId
+  )
+
+  $urlSlug = Get-LinearProjectUrlSlug -Url $Url
+  if ([string]::IsNullOrWhiteSpace($urlSlug) -or [string]::IsNullOrWhiteSpace($SlugId)) {
+    return $null
+  }
+
+  $suffix = '-' + $SlugId.Trim().ToLowerInvariant()
+  if ($urlSlug.ToLowerInvariant().EndsWith($suffix)) {
+    return $urlSlug.Substring(0, $urlSlug.Length - $suffix.Length)
+  }
+
+  return $null
+}
+
+function Get-LinearProjectMatchKeys {
+  param($Project)
+
+  @(
+    $Project.id,
+    $Project.name,
+    $Project.slugId,
+    $Project.url,
+    (Get-LinearProjectUrlSlug -Url $Project.url),
+    (Get-LinearHumanProjectSlug -Url $Project.url -SlugId $Project.slugId)
+  ) |
+    ForEach-Object { Normalize-LinearProjectReference -Value $_ } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    Select-Object -Unique
+}
+
+function Get-LinearProjects {
+  if ($script:LinearProjectsCache) {
+    return $script:LinearProjectsCache
+  }
+
+  if ([string]::IsNullOrWhiteSpace($env:LINEAR_API_KEY)) {
+    $script:LinearProjectsCache = @()
+    return $script:LinearProjectsCache
+  }
+
+  $query = 'query SymphonySetupProjects($first: Int!, $after: String) { projects(first: $first, after: $after) { nodes { id name slugId url } pageInfo { hasNextPage endCursor } } }'
+  $headers = @{ Authorization = $env:LINEAR_API_KEY; 'Content-Type' = 'application/json' }
+  $projects = @()
+  $after = $null
+
+  while ($true) {
+    $payload = @{ query = $query; variables = @{ first = 250; after = $after } } | ConvertTo-Json -Depth 5
+
+    try {
+      $response = Invoke-RestMethod -Method Post -Uri 'https://api.linear.app/graphql' -Headers $headers -Body $payload
+    } catch {
+      $script:LinearProjectsCache = @()
+      return $script:LinearProjectsCache
+    }
+
+    if ($response.errors) {
+      $script:LinearProjectsCache = @()
+      return $script:LinearProjectsCache
+    }
+
+    $page = @($response.data.projects.nodes)
+    if ($page.Count -gt 0) {
+      $projects += $page
+    }
+
+    if (-not $response.data.projects.pageInfo.hasNextPage) {
+      break
+    }
+
+    $after = $response.data.projects.pageInfo.endCursor
+    if ([string]::IsNullOrWhiteSpace($after)) {
+      break
+    }
+  }
+
+  $script:LinearProjectsCache = $projects
+  return $script:LinearProjectsCache
+}
+
+function Resolve-LinearProjectSlug {
+  param([string]$ProjectRef)
+
+  $normalizedRef = Normalize-LinearProjectReference -Value $ProjectRef
+  if ([string]::IsNullOrWhiteSpace($normalizedRef)) {
+    return $null
+  }
+
+  $projects = Get-LinearProjects
+  if ($projects.Count -eq 0) {
+    return $normalizedRef
+  }
+
+  $matches = @(
+    $projects | Where-Object { (Get-LinearProjectMatchKeys -Project $_) -contains $normalizedRef }
+  )
+
+  if ($matches.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace($matches[0].slugId)) {
+    return $matches[0].slugId
+  }
+
+  return $normalizedRef
+}
+
+function Resolve-LinearProject {
+  param([string]$ProjectRef)
+
+  $normalizedRef = Normalize-LinearProjectReference -Value $ProjectRef
+  if ([string]::IsNullOrWhiteSpace($normalizedRef)) {
+    return $null
+  }
+
+  $projects = Get-LinearProjects
+  if ($projects.Count -eq 0) {
+    return @{
+      input = $ProjectRef
+      normalized = $normalizedRef
+      slug = $normalizedRef
+      project = $null
+      status = 'unverified'
+    }
+  }
+
+  $matches = @(
+    $projects | Where-Object { (Get-LinearProjectMatchKeys -Project $_) -contains $normalizedRef }
+  )
+
+  if ($matches.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace($matches[0].slugId)) {
+    return @{
+      input = $ProjectRef
+      normalized = $normalizedRef
+      slug = $matches[0].slugId
+      project = $matches[0]
+      status = 'matched'
+    }
+  }
+
+  if ($matches.Count -gt 1) {
+    return @{
+      input = $ProjectRef
+      normalized = $normalizedRef
+      slug = $normalizedRef
+      project = $null
+      status = 'ambiguous'
+      matches = $matches
+    }
+  }
+
+  return @{
+    input = $ProjectRef
+    normalized = $normalizedRef
+    slug = $normalizedRef
+    project = $null
+    status = 'unmatched'
+  }
+}
+
+function Confirm-LinearProjectSelection {
+  param($Resolution)
+
+  if (-not $Resolution) {
+    return $false
+  }
+
+  switch ($Resolution.status) {
+    'matched' {
+      Write-Host "Resolved Linear project:" -ForegroundColor Cyan
+      Write-Host "  Name: $($Resolution.project.name)"
+      Write-Host "  Slug: $($Resolution.slug)"
+      if (-not [string]::IsNullOrWhiteSpace($Resolution.project.url)) {
+        Write-Host "  URL:  $($Resolution.project.url)"
+      }
+
+      $confirm = Read-Host "Use this Linear project? [Y/n]"
+      return ($confirm -notmatch '^(n|no)$')
+    }
+
+    'ambiguous' {
+      Write-Host "Linear project reference '$($Resolution.input)' matched multiple projects." -ForegroundColor Yellow
+      foreach ($match in $Resolution.matches) {
+        Write-Host "  - $($match.name) [$($match.slugId)] $($match.url)"
+      }
+      return $false
+    }
+
+    'unmatched' {
+      Write-Host "No unique Linear project match found for '$($Resolution.input)'." -ForegroundColor Yellow
+      Write-Host "Symphony can still write '$($Resolution.slug)', but it was not confirmed against Linear."
+      $confirm = Read-Host "Use this value anyway? [y/N]"
+      return ($confirm -match '^(y|yes)$')
+    }
+
+    default {
+      Write-Host "Linear project lookup could not be verified. Using '$($Resolution.slug)' requires manual confirmation." -ForegroundColor Yellow
+      $confirm = Read-Host "Use this value anyway? [y/N]"
+      return ($confirm -match '^(y|yes)$')
+    }
+  }
+}
+
+function Get-DefaultLinearProjectSlug {
+  param([string]$RepoRoot)
+
+  $projects = Get-LinearProjects
+  if ($projects.Count -eq 0) {
+    return ''
+  }
+
+  foreach ($candidate in Get-RepoNameCandidates -RepoRoot $RepoRoot) {
+    $normalizedCandidate = Normalize-LinearProjectReference -Value $candidate
+    if ([string]::IsNullOrWhiteSpace($normalizedCandidate)) {
+      continue
+    }
+
+    $matches = @(
+      $projects | Where-Object { (Get-LinearProjectMatchKeys -Project $_) -contains $normalizedCandidate }
+    )
+
+    if ($matches.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace($matches[0].slugId)) {
+      return $matches[0].slugId
+    }
+  }
+
+  return ''
+}
+function Get-DefaultSetupCommand {
+  param([string]$RepoRoot)
+
+  if (Test-Path (Join-Path $RepoRoot 'pnpm-lock.yaml')) { return 'pnpm install --frozen-lockfile' }
+  if (Test-Path (Join-Path $RepoRoot 'package-lock.json')) { return 'npm ci' }
+  if (Test-Path (Join-Path $RepoRoot 'yarn.lock')) { return 'yarn install --frozen-lockfile' }
+  if (Test-Path (Join-Path $RepoRoot 'bun.lockb')) { return 'bun install --frozen-lockfile' }
+  if (Test-Path (Join-Path $RepoRoot 'bun.lock')) { return 'bun install --frozen-lockfile' }
+  if (Test-Path (Join-Path $RepoRoot 'uv.lock')) { return 'uv sync' }
+  if (Test-Path (Join-Path $RepoRoot 'pyproject.toml')) { return 'uv sync' }
+  if (Test-Path (Join-Path $RepoRoot 'requirements.txt')) { return 'pip install -r requirements.txt' }
+
+  return ''
+}
+
+function Prompt-Default {
+  param(
+    [string]$Label,
+    [string]$Default = ''
+  )
+
+  if ($Default) {
+    $value = Read-Host "$Label [$Default]"
+    if ([string]::IsNullOrWhiteSpace($value)) {
+      return $Default
+    }
+    return $value.Trim()
+  }
+
+  while ($true) {
+    $value = Read-Host $Label
+    if (-not [string]::IsNullOrWhiteSpace($value)) {
+      return $value.Trim()
+    }
+  }
+}
+
+function New-WorkflowContent {
+  param(
+    [string]$ProjectSlug,
+    [string]$CloneUrl,
+    [string]$SetupCommand
+  )
+
+  $setupLines = @()
+  if ($CloneUrl) {
+    $setupLines += "    git clone --depth 1 $CloneUrl ."
+  }
+  if ($SetupCommand) {
+    foreach ($line in ($SetupCommand -split "`r?`n")) {
+      if (-not [string]::IsNullOrWhiteSpace($line)) {
+        $setupLines += "    $($line.Trim())"
+      }
+    }
+  }
+  if ($setupLines.Count -eq 0) {
+    $setupLines += '    true'
+  }
+
+  $afterCreate = ($setupLines -join "`n")
+
+  return @"
+---
+tracker:
+  kind: linear
+  api_key: `$LINEAR_API_KEY
+  project_slug: "$ProjectSlug"
+  active_states:
+    - Todo
+    - In Progress
+    - Merging
+    - Rework
+  terminal_states:
+    - Closed
+    - Cancelled
+    - Canceled
+    - Duplicate
+    - Done
+polling:
+  interval_ms: 5000
+workspace:
+  root: ~/code/symphony-workspaces
+hooks:
+  after_create: |
+$afterCreate
+  before_remove: |
+    branch=`$(git branch --show-current 2>/dev/null)
+    if [ -n "`$branch" ] && command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+      gh pr list --head "`$branch" --state open --json number --jq '.[].number' | while read -r pr; do
+        [ -n "`$pr" ] && gh pr close "`$pr" --comment "Closing because the Linear issue for branch `$branch entered a terminal state without merge."
+      done
+    fi
+agent:
+  max_concurrent_agents: 10
+  max_turns: 20
+codex:
+  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
+  approval_policy: never
+  thread_sandbox: danger-full-access
+  turn_sandbox_policy:
+    type: dangerFullAccess
+---
+
+You are working on a Linear ticket '{{ issue.identifier }}'
+
+{% if attempt %}
+Continuation context:
+
+- This is retry attempt #{{ attempt }} because the ticket is still in an active state.
+- Resume from the current workspace state instead of restarting from scratch.
+- Do not repeat already-completed investigation or validation unless needed for new code changes.
+- Do not end the turn while the issue remains in an active state unless you are blocked by missing required permissions/secrets.
+  {% endif %}
+
+Issue context:
+Identifier: {{ issue.identifier }}
+Title: {{ issue.title }}
+Current status: {{ issue.state }}
+Labels: {{ issue.labels }}
+URL: {{ issue.url }}
+
+Description:
+{% if issue.description %}
+{{ issue.description }}
+{% else %}
+No description provided.
+{% endif %}
+
+Instructions:
+
+1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
+2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
+3. Final message must report completed actions and blockers only. Do not include "next steps for user".
+
+Work only in the provided repository copy. Do not touch any other path.
+
+## Prerequisite: 'linear_graphql' tool is available
+
+The agent talks to Linear via the 'linear_graphql' tool injected by Symphony's app-server. If it is not present, stop and ask the user to configure Linear. Do not use a Linear MCP server — it returns full JSON payloads that waste tokens. Use 'linear_graphql' with narrowly scoped queries instead.
+
+## Default posture
+
+- Start by determining the ticket's current status, then follow the matching flow for that status.
+- Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
+- Spend extra effort up front on planning and verification design before implementation.
+- Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
+- Keep ticket metadata current (state, checklist, acceptance criteria, links).
+- Treat a single persistent Linear comment as the source of truth for progress.
+- Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
+- Treat any ticket-authored 'Validation', 'Test Plan', or 'Testing' section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
+- When meaningful out-of-scope improvements are discovered during execution,
+  file a separate Linear issue instead of expanding scope. The follow-up issue
+  must include a clear title, description, and acceptance criteria, be placed in
+  'Backlog', be assigned to the same project as the current issue, link the
+  current issue as 'related', and use 'blockedBy' when the follow-up depends on
+  the current issue.
+- Move status only when the matching quality bar is met.
+- Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
+- Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
+
+## Related skills
+
+- 'linear': interact with Linear.
+- 'commit': produce clean, logical commits during implementation.
+- 'push': keep remote branch current and publish updates.
+- 'pull': keep branch updated with latest 'origin/HEAD' before handoff.
+- 'land': when ticket reaches 'Merging', use the 'land' skill, which includes the merge loop.
+
+## Status map
+
+- 'Backlog' -> out of scope for this workflow; do not modify.
+- 'Todo' -> queued; immediately transition to 'In Progress' before active work.
+  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to 'Human Review').
+- 'In Progress' -> implementation actively underway.
+- 'Human Review' -> PR is attached and validated; waiting on human approval.
+- 'Merging' -> approved by human; execute the 'land' skill flow (do not call 'gh pr merge' directly).
+- 'Rework' -> reviewer requested changes; planning + implementation required.
+- 'Done' -> terminal state; no further action required.
+
+## Step 0: Determine current ticket state and route
+
+1. Fetch the issue by explicit ticket ID.
+2. Read the current state.
+3. Route to the matching flow:
+   - 'Backlog' -> do not modify issue content/state; stop and wait for human to move it to 'Todo'.
+   - 'Todo' -> immediately move to 'In Progress', then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
+     - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
+   - 'In Progress' -> continue execution flow from current scratchpad comment.
+   - 'Human Review' -> wait and poll for decision/review updates.
+   - 'Merging' -> on entry, use the 'land' skill; do not call 'gh pr merge' directly.
+   - 'Rework' -> run rework flow.
+   - 'Done' -> do nothing and shut down.
+4. Check whether a PR already exists for the current branch and whether it is closed.
+   - If a branch PR exists and is 'CLOSED' or 'MERGED', treat prior branch work as non-reusable for this run.
+   - Create a fresh branch from 'origin/HEAD' and restart execution flow as a new attempt.
+5. For 'Todo' tickets, do startup sequencing in this exact order:
+   - 'update_issue(..., state: "In Progress")'
+   - find/create '## Codex Workpad' bootstrap comment
+   - only then begin analysis/planning/implementation work.
+6. Add a short comment if state and issue content are inconsistent, then proceed with the safest flow.
+
+## Step 1: Start/continue execution (Todo or In Progress)
+
+1. Find or create a single persistent scratchpad comment for the issue.
+2. Immediately reconcile the workpad before new edits.
+3. Start work by writing/updating a hierarchical plan in the workpad comment.
+4. Add explicit acceptance criteria and validation steps in checklist form.
+5. Run the 'pull' skill before implementation.
+6. Reproduce first, then implement, validate, push, and move to 'Human Review' only when the quality bar is met.
+
+## Guardrails
+
+- Use exactly one persistent workpad comment ('## Codex Workpad') per issue.
+- Do not edit the issue body for planning or progress tracking.
+- If app-touching, run runtime validation and capture evidence.
+- Do not move to 'Human Review' unless validation is complete and PR feedback is resolved.
+"@
+}
+
+function Initialize-WorkflowFile {
+  param([string]$RepoRoot)
+
+  $workflowPath = Join-Path $RepoRoot 'WORKFLOW.md'
+  Write-Host "No WORKFLOW.md found for this repo." -ForegroundColor Yellow
+  Write-Host "Launching Symphony setup wizard..." -ForegroundColor Yellow
+
+  $confirm = Read-Host "Create WORKFLOW.md in $RepoRoot ? [Y/n]"
+  if ($confirm -match '^(n|no)$') {
+    throw 'Aborted without creating WORKFLOW.md.'
+  }
+
+  $defaultProjectSlug = Get-DefaultLinearProjectSlug -RepoRoot $RepoRoot
+
+  while ($true) {
+    $projectSlugInput = Prompt-Default -Label 'Linear project slug or project URL' -Default $defaultProjectSlug
+    $projectResolution = Resolve-LinearProject -ProjectRef $projectSlugInput
+
+    if (Confirm-LinearProjectSelection -Resolution $projectResolution) {
+      $projectSlug = $projectResolution.slug
+      break
+    }
+  }
+
+  $cloneUrl = Prompt-Default -Label 'Git clone URL' -Default (Get-GitRemoteUrl -RepoRoot $RepoRoot)
+  $setupCommand = Prompt-Default -Label 'Repo setup command (blank to skip)' -Default (Get-DefaultSetupCommand -RepoRoot $RepoRoot)
+
+  $content = New-WorkflowContent -ProjectSlug $projectSlug -CloneUrl $cloneUrl -SetupCommand $setupCommand
+  Set-Content -LiteralPath $workflowPath -Value $content
+
+  Write-Host "Created $workflowPath" -ForegroundColor Green
+  Write-Host 'Review it before first use, then commit and push it so Symphony workers can see it.' -ForegroundColor Yellow
+
+  return $workflowPath
+}
+
+$workflowPath = Resolve-WorkflowPath -StartDir (Get-Location)
+if (-not $workflowPath) {
+  $repoRoot = Get-RepoRoot
+  $workflowPath = Initialize-WorkflowFile -RepoRoot $repoRoot
+}
+
+$symphonyRoot = if ($env:SYMPHONY_ROOT) { $env:SYMPHONY_ROOT } else { '__SYMPHONY_ROOT__' }
+$symphonyElixir = Join-Path $symphonyRoot 'elixir'
+if (-not (Test-Path -LiteralPath $symphonyElixir)) {
+  throw "Symphony install not found at $symphonyElixir"
+}
+
+$gitShellPaths = @(
+  'C:\Program Files\Git\bin',
+  'C:\Program Files\Git\usr\bin'
+)
+foreach ($pathEntry in $gitShellPaths) {
+  if ((Test-Path -LiteralPath $pathEntry) -and -not (($env:PATH -split ';') -contains $pathEntry)) {
+    $env:PATH = "$pathEntry;$env:PATH"
+  }
+}
+
+$miseCommand = Get-Command mise -ErrorAction SilentlyContinue
+if (-not $miseCommand) {
+  $miseCandidates = @(
+    'C:\Users\kjell\AppData\Local\Microsoft\WinGet\Links\mise.exe',
+    'C:\Users\kjell\AppData\Local\Microsoft\WinGet\Packages\jdx.mise_Microsoft.Winget.Source_8wekyb3d8bbwe\mise\bin\mise.exe'
+  )
+  $wingetPackagesRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+  if (Test-Path -LiteralPath $wingetPackagesRoot) {
+    $miseCandidates += Get-ChildItem -LiteralPath $wingetPackagesRoot -Directory -Filter 'jdx.mise*' -ErrorAction SilentlyContinue |
+      ForEach-Object { Join-Path $_.FullName 'mise\bin\mise.exe' }
+  }
+  $miseSource = $miseCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+  if (-not $miseSource) {
+    throw 'mise was not found on PATH and no supported WinGet install path could be located.'
+  }
+} else {
+  $miseSource = $miseCommand.Source
+}
+
+if (-not ($SymphonyArgs -contains '--i-understand-that-this-will-be-running-without-the-usual-guardrails')) {
+  $SymphonyArgs += '--i-understand-that-this-will-be-running-without-the-usual-guardrails'
+}
+
+Push-Location $symphonyElixir
+try {
+  & $miseSource exec -- escript .\bin\symphony $workflowPath @SymphonyArgs
+} finally {
+  Pop-Location
+}
