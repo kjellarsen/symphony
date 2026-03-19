@@ -1,6 +1,7 @@
 ---
 tracker:
   kind: linear
+  api_key: $LINEAR_API_KEY
   project_slug: "symphony-0c79b11b75ea"
   active_states:
     - Todo

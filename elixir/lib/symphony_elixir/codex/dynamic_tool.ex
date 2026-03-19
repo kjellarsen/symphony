@@ -176,6 +176,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload(:invalid_linear_api_token) do
+    %{
+      "error" => %{
+        "message" => "Symphony's Linear auth was rejected. Refresh `linear.api_key` in `WORKFLOW.md` or `LINEAR_API_KEY`."
+      }
+    }
+  end
+
   defp tool_error_payload({:linear_api_status, status}) do
     %{
       "error" => %{

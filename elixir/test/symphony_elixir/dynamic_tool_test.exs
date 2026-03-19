@@ -249,6 +249,27 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              }
            }
 
+    invalid_token =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts -> {:error, :invalid_linear_api_token} end
+      )
+
+    assert invalid_token["success"] == false
+
+    assert [
+             %{
+               "text" => invalid_token_text
+             }
+           ] = invalid_token["contentItems"]
+
+    assert Jason.decode!(invalid_token_text) == %{
+             "error" => %{
+               "message" => "Symphony's Linear auth was rejected. Refresh `linear.api_key` in `WORKFLOW.md` or `LINEAR_API_KEY`."
+             }
+           }
+
     status_error =
       DynamicTool.execute(
         "linear_graphql",

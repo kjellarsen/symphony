@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Linear.Client do
   alias SymphonyElixir.{Config, Linear.Issue}
 
   @issue_page_size 50
+  @project_page_size 100
   @max_error_body_log_bytes 1_000
 
   @query """
@@ -45,6 +46,12 @@ defmodule SymphonyElixir.Linear.Client do
         }
         createdAt
         updatedAt
+        project {
+          id
+          name
+          slugId
+          url
+        }
       }
       pageInfo {
         hasNextPage
@@ -90,6 +97,29 @@ defmodule SymphonyElixir.Linear.Client do
         }
         createdAt
         updatedAt
+        project {
+          id
+          name
+          slugId
+          url
+        }
+      }
+    }
+  }
+  """
+
+  @project_query """
+  query SymphonyLinearProjects($first: Int!, $after: String) {
+    projects(first: $first, after: $after) {
+      nodes {
+        id
+        name
+        slugId
+        url
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
       }
     }
   }
@@ -106,18 +136,19 @@ defmodule SymphonyElixir.Linear.Client do
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
-    project_slug = tracker.project_slug
+    project_ref = tracker.project_slug
 
     cond do
       is_nil(tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      is_nil(project_slug) ->
+      is_nil(project_ref) ->
         {:error, :missing_linear_project_slug}
 
       true ->
-        with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
+        with {:ok, resolved_project} <- resolve_project_reference(project_ref),
+             {:ok, assignee_filter} <- routing_assignee_filter() do
+          do_fetch_by_states(resolved_project, tracker.active_states, assignee_filter)
         end
     end
   end
@@ -130,17 +161,19 @@ defmodule SymphonyElixir.Linear.Client do
       {:ok, []}
     else
       tracker = Config.settings!().tracker
-      project_slug = tracker.project_slug
+      project_ref = tracker.project_slug
 
       cond do
         is_nil(tracker.api_key) ->
           {:error, :missing_linear_api_token}
 
-        is_nil(project_slug) ->
+        is_nil(project_ref) ->
           {:error, :missing_linear_project_slug}
 
         true ->
-          do_fetch_by_states(project_slug, normalized_states, nil)
+          with {:ok, resolved_project} <- resolve_project_reference(project_ref) do
+            do_fetch_by_states(resolved_project, normalized_states, nil)
+          end
       end
     end
   end
@@ -154,8 +187,20 @@ defmodule SymphonyElixir.Linear.Client do
         {:ok, []}
 
       ids ->
-        with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_issue_states(ids, assignee_filter)
+        tracker = Config.settings!().tracker
+
+        cond do
+          is_nil(tracker.api_key) ->
+            {:error, :missing_linear_api_token}
+
+          is_nil(tracker.project_slug) ->
+            {:error, :missing_linear_project_slug}
+
+          true ->
+            with {:ok, resolved_project} <- resolve_project_reference(tracker.project_slug),
+                 {:ok, assignee_filter} <- routing_assignee_filter() do
+              do_fetch_issue_states(ids, resolved_project, assignee_filter)
+            end
         end
     end
   end
@@ -170,6 +215,14 @@ defmodule SymphonyElixir.Linear.Client do
          {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
       {:ok, body}
     else
+      {:ok, %{status: 401} = response} ->
+        Logger.error(
+          "Linear GraphQL request rejected with unauthorized status=401" <>
+            linear_error_context(payload, response)
+        )
+
+        {:error, :invalid_linear_api_token}
+
       {:ok, response} ->
         Logger.error(
           "Linear GraphQL request failed status=#{response.status}" <>
@@ -187,12 +240,12 @@ defmodule SymphonyElixir.Linear.Client do
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
   def normalize_issue_for_test(issue) when is_map(issue) do
-    normalize_issue(issue, nil)
+    normalize_issue(issue, nil, nil)
   end
 
   @doc false
-  @spec normalize_issue_for_test(map(), String.t() | nil) :: Issue.t() | nil
-  def normalize_issue_for_test(issue, assignee) when is_map(issue) do
+  @spec normalize_issue_for_test(map(), String.t() | nil, map() | nil) :: Issue.t() | nil
+  def normalize_issue_for_test(issue, assignee, resolved_project \\ nil) when is_map(issue) do
     assignee_filter =
       case assignee do
         value when is_binary(value) ->
@@ -205,7 +258,7 @@ defmodule SymphonyElixir.Linear.Client do
           nil
       end
 
-    normalize_issue(issue, assignee_filter)
+    normalize_issue(issue, assignee_filter, resolved_project)
   end
 
   @doc false
@@ -232,29 +285,39 @@ defmodule SymphonyElixir.Linear.Client do
         {:ok, []}
 
       ids ->
-        do_fetch_issue_states(ids, nil, graphql_fun)
+        with {:ok, resolved_project} <- resolve_project_reference(Config.settings!().tracker.project_slug, graphql_fun) do
+          do_fetch_issue_states(ids, resolved_project, nil, graphql_fun)
+        end
     end
   end
 
-  defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
-    do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
+  @doc false
+  @spec resolve_project_reference_for_test(String.t(), (String.t(), map() -> {:ok, map()} | {:error, term()})) ::
+          {:ok, map()} | {:error, term()}
+  def resolve_project_reference_for_test(project_ref, graphql_fun)
+      when is_binary(project_ref) and is_function(graphql_fun, 2) do
+    resolve_project_reference(project_ref, graphql_fun)
   end
 
-  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
+  defp do_fetch_by_states(resolved_project, state_names, assignee_filter) do
+    do_fetch_by_states_page(resolved_project, state_names, assignee_filter, nil, [])
+  end
+
+  defp do_fetch_by_states_page(resolved_project, state_names, assignee_filter, after_cursor, acc_issues) do
     with {:ok, body} <-
            graphql(@query, %{
-             projectSlug: project_slug,
+             projectSlug: resolved_project.slug_id,
              stateNames: state_names,
              first: @issue_page_size,
              relationFirst: @issue_page_size,
              after: after_cursor
            }),
-         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
+         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter, resolved_project) do
       updated_acc = prepend_page_issues(issues, acc_issues)
 
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
-          do_fetch_by_states_page(project_slug, state_names, assignee_filter, next_cursor, updated_acc)
+          do_fetch_by_states_page(resolved_project, state_names, assignee_filter, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
@@ -271,24 +334,24 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp finalize_paginated_issues(acc_issues) when is_list(acc_issues), do: Enum.reverse(acc_issues)
 
-  defp do_fetch_issue_states(ids, assignee_filter) do
-    do_fetch_issue_states(ids, assignee_filter, &graphql/2)
+  defp do_fetch_issue_states(ids, resolved_project, assignee_filter) do
+    do_fetch_issue_states(ids, resolved_project, assignee_filter, &graphql/2)
   end
 
-  defp do_fetch_issue_states(ids, assignee_filter, graphql_fun)
+  defp do_fetch_issue_states(ids, resolved_project, assignee_filter, graphql_fun)
        when is_list(ids) and is_function(graphql_fun, 2) do
     issue_order_index = issue_order_index(ids)
-    do_fetch_issue_states_page(ids, assignee_filter, graphql_fun, [], issue_order_index)
+    do_fetch_issue_states_page(ids, resolved_project, assignee_filter, graphql_fun, [], issue_order_index)
   end
 
-  defp do_fetch_issue_states_page([], _assignee_filter, _graphql_fun, acc_issues, issue_order_index) do
+  defp do_fetch_issue_states_page([], _resolved_project, _assignee_filter, _graphql_fun, acc_issues, issue_order_index) do
     acc_issues
     |> finalize_paginated_issues()
     |> sort_issues_by_requested_ids(issue_order_index)
     |> then(&{:ok, &1})
   end
 
-  defp do_fetch_issue_states_page(ids, assignee_filter, graphql_fun, acc_issues, issue_order_index) do
+  defp do_fetch_issue_states_page(ids, resolved_project, assignee_filter, graphql_fun, acc_issues, issue_order_index) do
     {batch_ids, rest_ids} = Enum.split(ids, @issue_page_size)
 
     case graphql_fun.(@query_by_ids, %{
@@ -297,9 +360,9 @@ defmodule SymphonyElixir.Linear.Client do
            relationFirst: @issue_page_size
          }) do
       {:ok, body} ->
-        with {:ok, issues} <- decode_linear_response(body, assignee_filter) do
+        with {:ok, issues} <- decode_linear_response(body, assignee_filter, resolved_project) do
           updated_acc = prepend_page_issues(issues, acc_issues)
-          do_fetch_issue_states_page(rest_ids, assignee_filter, graphql_fun, updated_acc, issue_order_index)
+          do_fetch_issue_states_page(rest_ids, resolved_project, assignee_filter, graphql_fun, updated_acc, issue_order_index)
         end
 
       {:error, reason} ->
@@ -402,20 +465,20 @@ defmodule SymphonyElixir.Linear.Client do
     )
   end
 
-  defp decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter) do
+  defp decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter, resolved_project) do
     issues =
       nodes
-      |> Enum.map(&normalize_issue(&1, assignee_filter))
+      |> Enum.map(&normalize_issue(&1, assignee_filter, resolved_project))
       |> Enum.reject(&is_nil(&1))
 
     {:ok, issues}
   end
 
-  defp decode_linear_response(%{"errors" => errors}, _assignee_filter) do
+  defp decode_linear_response(%{"errors" => errors}, _assignee_filter, _resolved_project) do
     {:error, {:linear_graphql_errors, errors}}
   end
 
-  defp decode_linear_response(_unknown, _assignee_filter) do
+  defp decode_linear_response(_unknown, _assignee_filter, _resolved_project) do
     {:error, :linear_unknown_payload}
   end
 
@@ -428,14 +491,17 @@ defmodule SymphonyElixir.Linear.Client do
              }
            }
          },
-         assignee_filter
+         assignee_filter,
+         resolved_project
        ) do
-    with {:ok, issues} <- decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter) do
+    with {:ok, issues} <-
+           decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter, resolved_project) do
       {:ok, issues, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
     end
   end
 
-  defp decode_linear_page_response(response, assignee_filter), do: decode_linear_response(response, assignee_filter)
+  defp decode_linear_page_response(response, assignee_filter, resolved_project),
+    do: decode_linear_response(response, assignee_filter, resolved_project)
 
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
        when is_binary(end_cursor) and byte_size(end_cursor) > 0 do
@@ -445,28 +511,192 @@ defmodule SymphonyElixir.Linear.Client do
   defp next_page_cursor(%{has_next_page: true}), do: {:error, :linear_missing_end_cursor}
   defp next_page_cursor(_), do: :done
 
-  defp normalize_issue(issue, assignee_filter) when is_map(issue) do
+  defp normalize_issue(issue, assignee_filter, resolved_project) when is_map(issue) do
     assignee = issue["assignee"]
 
-    %Issue{
-      id: issue["id"],
-      identifier: issue["identifier"],
-      title: issue["title"],
-      description: issue["description"],
-      priority: parse_priority(issue["priority"]),
-      state: get_in(issue, ["state", "name"]),
-      branch_name: issue["branchName"],
-      url: issue["url"],
-      assignee_id: assignee_field(assignee, "id"),
-      blocked_by: extract_blockers(issue),
-      labels: extract_labels(issue),
-      assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
-      created_at: parse_datetime(issue["createdAt"]),
-      updated_at: parse_datetime(issue["updatedAt"])
+    if project_matches?(issue["project"], resolved_project) do
+      %Issue{
+        id: issue["id"],
+        identifier: issue["identifier"],
+        title: issue["title"],
+        description: issue["description"],
+        priority: parse_priority(issue["priority"]),
+        state: get_in(issue, ["state", "name"]),
+        branch_name: issue["branchName"],
+        url: issue["url"],
+        assignee_id: assignee_field(assignee, "id"),
+        blocked_by: extract_blockers(issue),
+        labels: extract_labels(issue),
+        assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
+        created_at: parse_datetime(issue["createdAt"]),
+        updated_at: parse_datetime(issue["updatedAt"])
+      }
+    end
+  end
+
+  defp normalize_issue(_issue, _assignee_filter, _resolved_project), do: nil
+
+  defp resolve_project_reference(project_ref, graphql_fun \\ &graphql/2)
+
+  defp resolve_project_reference(project_ref, _graphql_fun) when not is_binary(project_ref) do
+    {:error, :missing_linear_project_slug}
+  end
+
+  defp resolve_project_reference(project_ref, graphql_fun) when is_function(graphql_fun, 2) do
+    normalized_ref = normalize_project_ref(project_ref)
+
+    if is_nil(normalized_ref) do
+      {:error, :missing_linear_project_slug}
+    else
+      do_resolve_project_reference(normalized_ref, graphql_fun, nil, [])
+    end
+  end
+
+  defp do_resolve_project_reference(normalized_ref, graphql_fun, after_cursor, acc_projects) do
+    case graphql_fun.(@project_query, %{first: @project_page_size, after: after_cursor}) do
+      {:ok, body} ->
+        with {:ok, projects, page_info} <- decode_project_page_response(body) do
+          updated_projects = prepend_page_issues(projects, acc_projects)
+
+          case next_page_cursor(page_info) do
+            {:ok, next_cursor} ->
+              do_resolve_project_reference(normalized_ref, graphql_fun, next_cursor, updated_projects)
+
+            :done ->
+              finalize_resolved_project(normalized_ref, finalize_paginated_issues(updated_projects))
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_project_page_response(%{
+         "data" => %{
+           "projects" => %{
+             "nodes" => nodes,
+             "pageInfo" => %{"hasNextPage" => has_next_page, "endCursor" => end_cursor}
+           }
+         }
+       })
+       when is_list(nodes) do
+    {:ok, nodes, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+  end
+
+  defp decode_project_page_response(%{"errors" => errors}) do
+    {:error, {:linear_graphql_errors, errors}}
+  end
+
+  defp decode_project_page_response(_response) do
+    {:error, :linear_unknown_payload}
+  end
+
+  defp finalize_resolved_project(normalized_ref, projects) when is_list(projects) do
+    matches =
+      Enum.filter(projects, fn
+        %{} = project -> project_matches_reference?(project, normalized_ref)
+        _ -> false
+      end)
+
+    case matches do
+      [%{} = project] ->
+        {:ok, normalize_resolved_project(project)}
+
+      [] ->
+        {:error, {:linear_project_not_found, normalized_ref}}
+
+      multiple ->
+        {:error, {:linear_project_ambiguous, normalized_ref, Enum.map(multiple, &summarize_project_match/1)}}
+    end
+  end
+
+  defp normalize_resolved_project(%{} = project) do
+    %{
+      id: project["id"],
+      name: project["name"],
+      slug_id: project["slugId"],
+      url: project["url"]
     }
   end
 
-  defp normalize_issue(_issue, _assignee_filter), do: nil
+  defp summarize_project_match(%{} = project) do
+    %{
+      id: project["id"],
+      name: project["name"],
+      slugId: project["slugId"],
+      url: project["url"]
+    }
+  end
+
+  defp project_matches?(%{} = project, %{slug_id: slug_id}) when is_binary(slug_id) do
+    normalize_project_ref(project["slugId"]) == normalize_project_ref(slug_id)
+  end
+
+  defp project_matches?(_project, nil), do: true
+  defp project_matches?(_project, _resolved_project), do: false
+
+  defp project_matches_reference?(%{} = project, normalized_ref) when is_binary(normalized_ref) do
+    project
+    |> project_match_keys()
+    |> MapSet.member?(normalized_ref)
+  end
+
+  defp project_match_keys(%{} = project) do
+    [
+      project["id"],
+      project["name"],
+      project["slugId"],
+      project["url"],
+      project_url_slug(project["url"]),
+      human_project_slug(project["url"], project["slugId"])
+    ]
+    |> Enum.map(&normalize_project_ref/1)
+    |> Enum.reject(&is_nil/1)
+    |> MapSet.new()
+  end
+
+  defp normalize_project_ref(value) when is_binary(value) do
+    case value |> String.trim() |> String.downcase() do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_project_ref(_value), do: nil
+
+  defp project_url_slug(url) when is_binary(url) do
+    uri = URI.parse(url)
+
+    uri.path
+    |> to_string()
+    |> String.trim("/")
+    |> String.split("/", trim: true)
+    |> List.last()
+  end
+
+  defp project_url_slug(_url), do: nil
+
+  defp human_project_slug(url, slug_id) when is_binary(url) and is_binary(slug_id) do
+    case project_url_slug(url) do
+      nil ->
+        nil
+
+      url_slug ->
+        suffix = "-" <> String.downcase(String.trim(slug_id))
+
+        if String.ends_with?(String.downcase(url_slug), suffix) do
+          String.slice(url_slug, 0, byte_size(url_slug) - byte_size(suffix))
+        else
+          nil
+        end
+    end
+  end
+
+  defp human_project_slug(_url, _slug_id), do: nil
 
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil
