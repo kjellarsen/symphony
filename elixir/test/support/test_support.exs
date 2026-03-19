@@ -22,7 +22,21 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0,
+          shell_join: 1,
+          shell_sleep_command: 1,
+          shell_copy_command: 2,
+          shell_fail_command: 2,
+          shell_write_line_command: 2,
+          shell_append_line_command: 2,
+          shell_repeat_char_and_fail_command: 3,
+          shell_git_clone_command: 1,
+          shell_git_clone_command: 2
+        ]
 
       setup do
         workflow_root =
@@ -68,6 +82,89 @@ defmodule SymphonyElixir.TestSupport do
 
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
+
+  def shell_join(commands) when is_list(commands) do
+    separator =
+      case :os.type() do
+        {:win32, _family} -> "; "
+        _ -> "\n"
+      end
+
+    commands
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join(separator)
+  end
+
+  def shell_sleep_command(seconds) when is_integer(seconds) and seconds >= 0 do
+    case :os.type() do
+      {:win32, _family} -> "Start-Sleep -Seconds #{seconds}"
+      _ -> "sleep #{seconds}"
+    end
+  end
+
+  def shell_copy_command(source, destination) when is_binary(source) and is_binary(destination) do
+    case :os.type() do
+      {:win32, _family} ->
+        "Copy-Item -LiteralPath #{powershell_quote(source)} -Destination #{powershell_quote(destination)}"
+
+      _ ->
+        "cp #{shell_quote(source)} #{shell_quote(destination)}"
+    end
+  end
+
+  def shell_fail_command(message, status) when is_binary(message) and is_integer(status) do
+    case :os.type() do
+      {:win32, _family} ->
+        "Write-Output #{powershell_quote(message)}; exit #{status}"
+
+      _ ->
+        "printf '%s\\n' #{shell_quote(message)}\nexit #{status}"
+    end
+  end
+
+  def shell_write_line_command(path, line) when is_binary(path) and is_binary(line) do
+    case :os.type() do
+      {:win32, _family} ->
+        "Set-Content -LiteralPath #{powershell_quote(path)} -Value #{powershell_quote(line)}"
+
+      _ ->
+        "printf '%s\\n' #{shell_quote(line)} > #{shell_quote(path)}"
+    end
+  end
+
+  def shell_append_line_command(path, line) when is_binary(path) and is_binary(line) do
+    case :os.type() do
+      {:win32, _family} ->
+        "Add-Content -LiteralPath #{powershell_quote(path)} -Value #{powershell_quote(line)}"
+
+      _ ->
+        "printf '%s\\n' #{shell_quote(line)} >> #{shell_quote(path)}"
+    end
+  end
+
+  def shell_repeat_char_and_fail_command(char, count, status)
+      when is_binary(char) and is_integer(count) and count >= 0 and is_integer(status) do
+    case :os.type() do
+      {:win32, _family} ->
+        "$i = 0; while ($i -lt #{count}) { [Console]::Out.Write(#{powershell_quote(char)}); $i++ }; exit #{status}"
+
+      _ ->
+        "i=0; while [ $i -lt #{count} ]; do printf #{shell_quote(char)}; i=$((i+1)); done; exit #{status}"
+    end
+  end
+
+  def shell_git_clone_command(source), do: shell_git_clone_command(source, ".")
+
+  def shell_git_clone_command(source, destination) when is_binary(source) and is_binary(destination) do
+    case :os.type() do
+      {:win32, _family} ->
+        "git clone --depth 1 #{powershell_quote(source)} #{powershell_quote(destination)}"
+
+      _ ->
+        "git clone --depth 1 #{shell_quote(source)} #{shell_quote(destination)}"
+    end
+  end
 
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
@@ -286,5 +383,13 @@ defmodule SymphonyElixir.TestSupport do
       |> Enum.map_join("\n", &("    " <> &1))
 
     "  #{name}: |\n#{indented}"
+  end
+
+  defp powershell_quote(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "''") <> "'"
+  end
+
+  defp shell_quote(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 end

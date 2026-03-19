@@ -293,12 +293,13 @@ defmodule SymphonyElixir.Workspace do
 
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms
+    {shell_executable, shell_args, env} = hook_command_spec(command)
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd(shell_executable, shell_args, cd: workspace, env: env, stderr_to_stdout: true)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -353,6 +354,116 @@ defmodule SymphonyElixir.Workspace do
       false ->
         binary_part(binary_output, 0, max_bytes) <> "... (truncated)"
     end
+  end
+
+  @doc false
+  def hook_command_env_for_test(base_env \\ System.get_env()) when is_map(base_env) do
+    hook_command_env(base_env)
+  end
+
+  @doc false
+  def hook_command_spec_for_test(command, base_env \\ System.get_env())
+      when is_binary(command) and is_map(base_env) do
+    {executable, args, env} = hook_command_spec(command, base_env)
+    %{executable: executable, args: args, env: env}
+  end
+
+  defp hook_command_spec(command), do: hook_command_spec(command, System.get_env())
+
+  defp hook_command_spec(command, base_env)
+
+  defp hook_command_spec(command, base_env) when is_binary(command) and is_map(base_env) do
+    case :os.type() do
+      {:win32, _family} ->
+        {
+          windows_hook_shell_executable(),
+          windows_hook_shell_args(command),
+          hook_command_env(base_env)
+        }
+
+      _ ->
+        {"sh", ["-lc", command], []}
+    end
+  end
+
+  defp hook_command_env(base_env)
+
+  defp hook_command_env(base_env) when is_map(base_env) do
+    case :os.type() do
+      {:win32, _family} ->
+        current_path = Map.get(base_env, "PATH", "")
+        updated_path = augment_windows_path(current_path, windows_hook_path_entries(base_env))
+
+        if updated_path == current_path do
+          []
+        else
+          [{"PATH", updated_path}]
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp windows_hook_path_entries(base_env) when is_map(base_env) do
+    [
+      join_env_path(base_env, "APPDATA", "npm"),
+      join_env_path(base_env, "LOCALAPPDATA", "pnpm"),
+      join_env_path(base_env, "ProgramFiles", "nodejs"),
+      join_env_path(base_env, "ProgramFiles(x86)", "nodejs")
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp join_env_path(base_env, env_var, child) when is_map(base_env) do
+    case Map.get(base_env, env_var) do
+      value when is_binary(value) and value != "" ->
+        value
+        |> Path.join(child)
+        |> normalize_windows_path()
+
+      _ ->
+        nil
+    end
+  end
+
+  defp augment_windows_path(current_path, new_entries) do
+    {existing_entries, existing_keys} =
+      current_path
+      |> String.split(";", trim: true)
+      |> Enum.reduce({[], MapSet.new()}, fn entry, {entries, keys} ->
+        key = normalize_windows_path_key(entry)
+        {[entry | entries], MapSet.put(keys, key)}
+      end)
+
+    additional_entries =
+      new_entries
+      |> Enum.reject(&MapSet.member?(existing_keys, normalize_windows_path_key(&1)))
+      |> Enum.uniq_by(&normalize_windows_path_key/1)
+
+    (Enum.reverse(existing_entries) ++ additional_entries)
+    |> Enum.join(";")
+  end
+
+  defp normalize_windows_path_key(path) when is_binary(path) do
+    path
+    |> normalize_windows_path()
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_windows_path(path) when is_binary(path) do
+    String.replace(path, "/", "\\")
+  end
+
+  defp windows_hook_shell_executable do
+    System.find_executable("pwsh") ||
+      System.find_executable("powershell") ||
+      "powershell"
+  end
+
+  defp windows_hook_shell_args(command) when is_binary(command) do
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command]
   end
 
   defp validate_workspace_path(workspace, nil) when is_binary(workspace) do

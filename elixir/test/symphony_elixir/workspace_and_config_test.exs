@@ -28,12 +28,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "git clone --depth 1 #{template_repo} ."
+        hook_after_create: shell_git_clone_command(template_repo)
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("S-1")
       assert File.exists?(Path.join(workspace, ".git"))
-      assert File.read!(Path.join(workspace, "README.md")) == "hook clone\n"
+      assert String.trim_trailing(File.read!(Path.join(workspace, "README.md"))) == "hook clone"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
     after
       File.rm_rf(test_root)
@@ -66,7 +66,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo first > README.md"
+        hook_after_create: shell_write_line_command("README.md", "first")
       )
 
       assert {:ok, first_workspace} = Workspace.create_for_issue("MT-REUSE")
@@ -201,7 +201,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo nope && exit 17"
+        hook_after_create: shell_fail_command("nope", 17)
       )
 
       assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
@@ -222,7 +222,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         hook_timeout_ms: 10,
-        hook_after_create: "sleep 1"
+        hook_after_create: shell_sleep_command(1)
       )
 
       assert {:error, {:workspace_hook_timeout, "after_create", 10}} =
@@ -250,6 +250,54 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, []} = File.ls(workspace)
     after
       File.rm_rf(workspace_root)
+    end
+  end
+
+  test "workspace hook environment adds common Windows node tool paths without duplicating PATH entries" do
+    base_env = %{
+      "PATH" => "C:\\Windows\\System32;C:\\Users\\kjell\\AppData\\Roaming\\npm",
+      "APPDATA" => "C:\\Users\\kjell\\AppData\\Roaming",
+      "LOCALAPPDATA" => "C:\\Users\\kjell\\AppData\\Local",
+      "ProgramFiles" => "C:\\Program Files",
+      "ProgramFiles(x86)" => "C:\\Program Files (x86)"
+    }
+
+    case :os.type() do
+      {:win32, _family} ->
+        assert [{"PATH", augmented_path}] = Workspace.hook_command_env_for_test(base_env)
+
+        assert augmented_path ==
+                 Enum.join(
+                   [
+                     "C:\\Windows\\System32",
+                     "C:\\Users\\kjell\\AppData\\Roaming\\npm",
+                     "C:\\Users\\kjell\\AppData\\Local\\pnpm",
+                     "C:\\Program Files\\nodejs",
+                     "C:\\Program Files (x86)\\nodejs"
+                   ],
+                   ";"
+                 )
+
+      _ ->
+        assert [] == Workspace.hook_command_env_for_test(base_env)
+    end
+  end
+
+  test "workspace hooks use an OS-appropriate shell command runner" do
+    spec = Workspace.hook_command_spec_for_test("echo hi")
+
+    case :os.type() do
+      {:win32, _family} ->
+        assert List.last(spec.args) == "echo hi"
+        assert Enum.take(spec.args, 5) == ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+
+        assert String.ends_with?(String.downcase(spec.executable), "pwsh.exe") or
+                 String.ends_with?(String.downcase(spec.executable), "powershell.exe") or
+                 spec.executable in ["pwsh", "powershell"]
+
+      _ ->
+        assert spec.executable == "sh"
+        assert spec.args == ["-lc", "echo hi"]
     end
   end
 
@@ -390,6 +438,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     issue_ids = Enum.map(1..55, &"issue-#{&1}")
     first_batch_ids = Enum.take(issue_ids, 50)
     second_batch_ids = Enum.drop(issue_ids, 50)
+    project_ref = "bankman-trader"
 
     raw_issue = fn issue_id ->
       suffix = String.replace_prefix(issue_id, "issue-", "")
@@ -401,32 +450,149 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         "description" => "Description #{suffix}",
         "state" => %{"name" => "In Progress"},
         "labels" => %{"nodes" => []},
-        "inverseRelations" => %{"nodes" => []}
+        "inverseRelations" => %{"nodes" => []},
+        "project" => %{
+          "id" => "project-1",
+          "name" => "Bankman Trader",
+          "slugId" => "0da14365b593",
+          "url" => "https://linear.app/tinkerlabsai/project/bankman-trader-0da14365b593"
+        }
       }
     end
 
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_project_slug: project_ref)
+
     graphql_fun = fn query, variables ->
-      send(self(), {:fetch_issue_states_page, query, variables})
+      cond do
+        query =~ "SymphonyLinearProjects" ->
+          send(self(), {:resolve_project_page, query, variables})
 
-      body = %{
-        "data" => %{
-          "issues" => %{
-            "nodes" => Enum.map(variables.ids, raw_issue)
+          {:ok,
+           %{
+             "data" => %{
+               "projects" => %{
+                 "nodes" => [
+                   %{
+                     "id" => "project-1",
+                     "name" => "Bankman Trader",
+                     "slugId" => "0da14365b593",
+                     "url" => "https://linear.app/tinkerlabsai/project/bankman-trader-0da14365b593"
+                   }
+                 ],
+                 "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+               }
+             }
+           }}
+
+        true ->
+          send(self(), {:fetch_issue_states_page, query, variables})
+
+          body = %{
+            "data" => %{
+              "issues" => %{
+                "nodes" => Enum.map(variables.ids, raw_issue)
+              }
+            }
           }
-        }
-      }
 
-      {:ok, body}
+          {:ok, body}
+      end
     end
 
     assert {:ok, issues} = Client.fetch_issue_states_by_ids_for_test(issue_ids, graphql_fun)
 
     assert Enum.map(issues, & &1.id) == issue_ids
+    assert_receive {:resolve_project_page, project_query, %{after: nil, first: 100}}
+    assert project_query =~ "SymphonyLinearProjects"
 
     assert_receive {:fetch_issue_states_page, query, %{ids: ^first_batch_ids, first: 50, relationFirst: 50}}
     assert query =~ "SymphonyLinearIssuesById"
 
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
+  end
+
+  test "linear client resolves a human-readable project reference from the project url slug" do
+    graphql_fun = fn query, variables ->
+      send(self(), {:resolve_project_page, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "projects" => %{
+             "nodes" => [
+               %{
+                 "id" => "project-1",
+                 "name" => "Bankman Trader",
+                 "slugId" => "0da14365b593",
+                 "url" => "https://linear.app/tinkerlabsai/project/bankman-trader-0da14365b593"
+               }
+             ],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, resolved_project} =
+             Client.resolve_project_reference_for_test("bankman-trader", graphql_fun)
+
+    assert resolved_project.slug_id == "0da14365b593"
+    assert resolved_project.name == "Bankman Trader"
+    assert_receive {:resolve_project_page, query, %{after: nil, first: 100}}
+    assert query =~ "SymphonyLinearProjects"
+  end
+
+  test "linear client filters issue state refreshes to the configured project" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_project_slug: "bankman-trader")
+
+    graphql_fun = fn query, _variables ->
+      cond do
+        query =~ "SymphonyLinearProjects" ->
+          {:ok,
+           %{
+             "data" => %{
+               "projects" => %{
+                 "nodes" => [
+                   %{
+                     "id" => "project-1",
+                     "name" => "Bankman Trader",
+                     "slugId" => "0da14365b593",
+                     "url" => "https://linear.app/tinkerlabsai/project/bankman-trader-0da14365b593"
+                   }
+                 ],
+                 "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+               }
+             }
+           }}
+
+        true ->
+          {:ok,
+           %{
+             "data" => %{
+               "issues" => %{
+                 "nodes" => [
+                   %{
+                     "id" => "issue-1",
+                     "identifier" => "MT-1",
+                     "title" => "Wrong project issue",
+                     "state" => %{"name" => "In Progress"},
+                     "labels" => %{"nodes" => []},
+                     "inverseRelations" => %{"nodes" => []},
+                     "project" => %{
+                       "id" => "project-2",
+                       "name" => "Different Project",
+                       "slugId" => "other-project",
+                       "url" => "https://linear.app/tinkerlabsai/project/other-project-abcd1234"
+                     }
+                   }
+                 ]
+               }
+             }
+           }}
+      end
+    end
+
+    assert {:ok, []} = Client.fetch_issue_states_by_ids_for_test(["issue-1"], graphql_fun)
   end
 
   test "linear client logs response bodies for non-200 graphql responses" do
@@ -456,6 +622,27 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Linear GraphQL request failed status=400"
     assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
+  end
+
+  test "linear client returns an explicit auth error for unauthorized graphql responses" do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, :invalid_linear_api_token} =
+                 Client.graphql(
+                   "query Viewer { viewer { id } }",
+                   %{},
+                   request_fun: fn _payload, _headers ->
+                     {:ok,
+                      %{
+                        status: 401,
+                        body: %{"errors" => [%{"message" => "Authentication required"}]}
+                      }}
+                   end
+                 )
+      end)
+
+    assert log =~ "Linear GraphQL request rejected with unauthorized status=401"
+    assert log =~ "Authentication required"
   end
 
   test "orchestrator sorts dispatch by priority then oldest created_at" do
@@ -610,22 +797,27 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
-        hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
+        hook_after_create:
+          shell_join([
+            shell_write_line_command("after_create.log", "after_create"),
+            shell_append_line_command(after_create_counter, "call")
+          ]),
+        hook_before_remove: shell_write_line_command(before_remove_marker, "before_remove")
       )
 
       config = Config.settings!()
-      assert config.hooks.after_create =~ "echo after_create > after_create.log"
-      assert config.hooks.before_remove =~ "echo before_remove >"
+      assert config.hooks.after_create =~ "after_create.log"
+      assert config.hooks.after_create =~ after_create_counter
+      assert config.hooks.before_remove =~ before_remove_marker
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS")
-      assert File.read!(Path.join(workspace, "after_create.log")) == "after_create\n"
+      assert String.trim_trailing(File.read!(Path.join(workspace, "after_create.log"))) == "after_create"
 
       assert {:ok, _workspace} = Workspace.create_for_issue("MT-HOOKS")
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
 
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS")
-      assert File.read!(before_remove_marker) == "before_remove\n"
+      assert String.trim_trailing(File.read!(before_remove_marker)) == "before_remove"
       refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
@@ -646,7 +838,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_before_remove: "echo failure && exit 17"
+        hook_before_remove: shell_fail_command("failure", 17)
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-FAIL")
@@ -671,7 +863,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_before_remove: "i=0; while [ $i -lt 3000 ]; do printf a; i=$((i+1)); done; exit 17"
+        hook_before_remove: shell_repeat_char_and_fail_command("a", 3000, 17)
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-LARGE-FAIL")
@@ -708,7 +900,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_before_remove: "sleep 1"
+        hook_before_remove: shell_sleep_command(1)
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")

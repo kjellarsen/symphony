@@ -1042,7 +1042,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: shell_copy_command(Path.join(template_repo, "README.md"), "README.md"),
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -1127,7 +1127,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: shell_copy_command(Path.join(template_repo, "README.md"), "README.md"),
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -1223,7 +1223,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: shell_copy_command(Path.join(template_repo, "README.md"), "README.md"),
         codex_command: "#{codex_binary} app-server",
         max_turns: 3
       )
@@ -1353,7 +1353,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        hook_after_create: shell_copy_command(Path.join(template_repo, "README.md"), "README.md"),
         codex_command: "#{codex_binary} app-server",
         max_turns: 2
       )
